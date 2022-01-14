@@ -8,13 +8,11 @@ from scipy.stats import pearsonr
 import pickle
 import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
-from scipy.optimize import minimize
-from scipy.optimize import Bounds
 from pathlib import Path
 from os import listdir
-from scipy.signal import savgol_filter
-from scipy.ndimage import uniform_filter1d
 
+# all code written by Dave Purnell https://github.com/purnelldj/gnssr_lowcost
+# run using python version 3.6
 
 def glonasswlen(prn, signal):
     channel = [1, -4, 5, 6, 1, -4, 5, 6, -2, -7, 0, -1, -2, -7, 0, -1, 4, -3, 3, 2, 4, -3, 3, 2]
@@ -137,14 +135,13 @@ def gnss2azelv(xyz_ant, xyz_sat):
 def readsp3file(sp3str):
     """
     Reads an sp3 orbit file and returns satellite identities and xyz coordinates
-    maybe better to have output time array in matplotlib format
-    :param sp3str:
-    :return:
-    t_sp3: time array in datetime format
-    xyz_sp3: xyz position of all satellites, an array of size [92, tlen, 3]
-    the first dimension is for the satellites (1-32 = GPS, 33-56 = GLONASS, 57-92 = Galileo
-    the second dimension is for the time (length of the t_sp3 vector)
-    the third dimesion is for the x, y, z coordinates (converted to meters)
+    input
+    'sp3str': string to location of .sp3 orbit data
+    outputs
+    'sp3_df': pandas data frame object with 5 columns
+    'DateTime' date and time of data in datetime.datetime format
+    'sat_prn' sat constellation and number, e.g., 'G01' for GPS sat #1 ('R' for GLONASS, 'E' for Galileo)
+    'X', 'Y' and 'Z' are ECEF coordinates (in m)
     """
     startid = 1
     counter = -1
@@ -179,23 +176,37 @@ def readsp3file(sp3str):
         X_arr = X_arr[:counter]
         Y_arr = Y_arr[:counter]
         Z_arr = Z_arr[:counter]
-    sp3_data = {'DateTime': datetime_arr, 'Satellite PRN': satprn_arr, 'X': X_arr, 'Y': Y_arr, 'Z': Z_arr}
+    sp3_data = {'DateTime': datetime_arr, 'sat_prn': satprn_arr, 'X': X_arr, 'Y': Y_arr, 'Z': Z_arr}
     sp3_df = pd.DataFrame(sp3_data)
     return sp3_df
 
 
-def nmea2snr(nmeastr, sp3dir, snrdir, **kwargs):
+def nmea2snr(nmeastr, snrdir, sp3dir=False, **kwargs):
     """
     This function reads NMEA 0183 format GPS data (e.g., recorded by low-cost GNSS hardware) and
-    converts it into files for GNSS-R analysis
+    converts it into organised files for GNSS-R analysis
     :param nmeastr: path to nmea file
-    :param sp3dir: path to directory with sp3 orbit data
     :param snrdir: path to directory where organised SNR data is saved as 'pickle' files
+    :param sp3dir: path to directory with sp3 orbit data,
+    if sp3dir=False then saves the azimuth and elevation angle data from NMEA file
     to load use the following code:
     f = open(snrstr, 'rb')
     snr_df = pickle.load(f)  # SNR data
     fix_df = pickle.load(f)  # fix data (lat, lon, height)
     f.close()
+    OUTPUT DATA FORMAT
+    'snr_df' is in pandas.DataFrame format with the following columns
+    'datenum': time of observation in maplotlib dates format
+    'sat_prn': satellite constellation and number in the same format as in '.SP3' files (e.g., G01 = GPS sat 1)
+    'elevation': elevation angle of satellite in degrees
+    'azimuth': azimuth angle of satellite in degrees
+    'snr': SNR in units of dB-Hz
+    'seconds': seconds of day of observation
+    'fix_df' is in pandas.DataFrame format with the following columns
+    'seconds': seconds of day
+    'latitude': in degrees
+    'longitude': in degrees
+    'height': in m relative to WGS84 elipsoid
     :**kwargs:
     elvlims: elevation angle limits (default [0, 90])
     azilims: azimuth angle limits (default = [0, 360])
@@ -224,6 +235,11 @@ def nmea2snr(nmeastr, sp3dir, snrdir, **kwargs):
             sect = np.nan
             while line:
                 row = line.split(',')
+                if '$' in line[1:-1]:
+                    print('misplaced $ issue')
+                    line = f.readline()
+                    cnt = cnt + 1
+                    continue
                 if row[0][3:6] == 'RMC':
                     sect = int(float(row[1][0:2]) * 60 * 60 + float(row[1][2:4]) * 60 + float(row[1][4:]))
                     curdt = datetime.datetime(int(row[9][4:6])+2000,
@@ -244,11 +260,6 @@ def nmea2snr(nmeastr, sp3dir, snrdir, **kwargs):
                     lont = float(row[4][0:3]) + float(row[4][3:])/60
                     if row[5] == 'W':
                         lont = -lont
-                    if '$' in str(row[11]):
-                        print('this random $ issue?')
-                        line = f.readline()
-                        cnt = cnt + 1
-                        continue
                     hgtt = float(row[9])+float(row[11])
                     fixdata[sect, :] = [sect, latt, lont, hgtt]
                 elif row[0][3:6] == 'GSV' and np.isnan(sect) == 0:
@@ -279,6 +290,7 @@ def nmea2snr(nmeastr, sp3dir, snrdir, **kwargs):
                                 nmeadata[satidt] = np.empty((86400, 4))
                                 nmeadata[satidt][:] = np.nan
                             nmeadata[satidt][sect, :] = [sect, int(row[ind + 1]), int(row[ind + 2]), int(row[ind + 3])]
+                            # elevation, azimuth, SNR
                         ind = ind + 4
                 line = f.readline()
                 cnt = cnt + 1
@@ -289,6 +301,7 @@ def nmea2snr(nmeastr, sp3dir, snrdir, **kwargs):
             print('empty file')
             return
         f.close()
+
         if 'xyz_ant' in kwargs:
             xyz_ant = kwargs.get('xyz_ant')
         else:
@@ -302,39 +315,52 @@ def nmea2snr(nmeastr, sp3dir, snrdir, **kwargs):
             # print('mean hgt is ' + str(meanhgt))
             # then use lla2ecef, not the end of the world if not too precise
             xyz_ant = lla2ecef(meanlat/180*np.pi, meanlon/180*np.pi, meanhgt)
-        # get date strings for finding the sp3 files
-        doy_str = str(curdt.timetuple().tm_yday)
-        year_str = str(curdt.year)
-        # you could add more options for the orbit files if you want
-        # since the naming conventions are different, give diff types of files unique directory names
-        if sp3dir[-3:] == 'COD':
-            sp3str = sp3dir + '/COD0MGXFIN_' + year_str + doy_str + '0000_01D_05M_ORB.SP3'
-        elif sp3dir[-3:] == 'GFZ':
-            sp3str = sp3dir + '/GFZ0MGXRAP_' + year_str + doy_str + '0000_01D_05M_ORB.SP3'
-        else:
-            print('you need to configure this code for different SP3 orbit files')
-            return
-        print('getting orbit info for ' + str(curdt.date()))
-        dt = 1/86400  # maximum possible resolution
+
+        dt = 1  # maximum possible resolution
         if 'tempres' in kwargs:
             dt = kwargs.get('tempres')
-            dt = dt/86400
+
+        if sp3dir:
+            # get date strings for finding the sp3 files
+            doy_str = str(curdt.timetuple().tm_yday)
+            year_str = str(curdt.year)
+            # you could add more options for the orbit files if you want
+            # since the naming conventions are different, give diff types of files unique directory names
+            if sp3dir[-3:] == 'COD':
+                sp3str = sp3dir + '/COD0MGXFIN_' + year_str + doy_str + '0000_01D_05M_ORB.SP3'
+            elif sp3dir[-3:] == 'GFZ':
+                sp3str = sp3dir + '/GFZ0MGXRAP_' + year_str + doy_str + '0000_01D_05M_ORB.SP3'
+            else:
+                print('you need to configure this code for different SP3 orbit files')
+                return
+            print('getting orbit info for ' + str(curdt.date()))
+            sp3_df = readsp3file(sp3str)
+        else:
+            print('no sp3 data - using azimuth and elevation values directly from NMEA')
+
+        # now doing putting into snr_data format
         snrdata = np.empty((0, 6))
-        sp3_df = readsp3file(sp3str)
         for satidt in nmeadata:
-            # find the corresponding times with snr data (non-nan values)
             nmeadatat = nmeadata[satidt]
-            nanfilter = np.isnan(nmeadatat[:, 0]) == 0
-            nmeadatat = nmeadatat[nanfilter, :]
-            secst = nmeadatat[:, 0]
-            datet_nmea = date2num(curdt) + secst/86400
-            # first check if orbit data exists
-            if satidt in sp3_df['Satellite PRN'].values:
-                tfilter = sp3_df['Satellite PRN'] == satidt
+            # first get rid of nans
+            tfilter = np.isnan(nmeadatat[:, 0]) == 0
+            nmeadatat = nmeadatat[tfilter, :]
+            # now do the dt adjustment
+            tfilter = np.mod(nmeadatat[:, 0], dt) == 0
+            nmeadatat = nmeadatat[tfilter, :]
+            # now make a datetime array
+            datetime_t = curdt + nmeadatat[:, 0] * datetime.timedelta(seconds=1)
+            # now make a satellite a
+            tempsats = np.empty((len(datetime_t)), dtype=object)
+            tempsats[:] = satidt
+            tempdata = np.column_stack((date2num(datetime_t), tempsats, nmeadatat[:, 1], nmeadatat[:, 2],
+                                        nmeadatat[:, 3], nmeadatat[:, 0]))
+            if sp3dir and satidt in sp3_df['sat_prn'].values:
+                tfilter = sp3_df['sat_prn'] == satidt
                 tt_sp3 = sp3_df['DateTime'][tfilter].values
-                tt_sp3 = date2num(tt_sp3)
-                # this is where you would put the alternate tempres
+                tt_sp3 = [(tt - tt_sp3[0]).astype('timedelta64[s]').astype(int) for tt in tt_sp3]
                 tt_sp3_new = np.linspace(tt_sp3[0], tt_sp3[-1], int((tt_sp3[-1] - tt_sp3[0]) / dt) + 1)
+                t_sp3_new = np.array(tt_sp3_new, dtype=float)
                 xt = sp3_df['X'][tfilter].values
                 xtck = interpolate.splrep(tt_sp3, xt)
                 x_new = interpolate.splev(tt_sp3_new, xtck)
@@ -346,24 +372,23 @@ def nmea2snr(nmeastr, sp3dir, snrdir, **kwargs):
                 z_new = interpolate.splev(tt_sp3_new, ztck)
                 xyz_new = np.column_stack((x_new, y_new, z_new))
                 azit, elvt = gnss2azelv(xyz_ant, xyz_new)
-                indt = np.logical_and(azit >= azilims[0], azit <= azilims[1])
-                azit = azit[indt]
-                elvt = elvt[indt]
-                tt_sp3_new = tt_sp3_new[indt]
-                indt = np.logical_and(elvt >= elvlims[0], elvt <= elvlims[1])
-                azit = azit[indt]
-                elvt = elvt[indt]
-                tt_sp3_new = tt_sp3_new[indt]
                 # now find the overlapping dates
-                _, ind_nmea, ind_sp3 = np.intersect1d(datet_nmea, tt_sp3_new, return_indices=True)
-                tempsats = np.empty((len(ind_nmea)), dtype=object)
-                tempsats[:] = satidt
-                tempdata = np.column_stack((datet_nmea[ind_nmea], tempsats, elvt[ind_sp3], azit[ind_sp3],
-                                            nmeadatat[ind_nmea, 3], secst[ind_nmea]))
+                _, ind_nmea, ind_sp3 = np.intersect1d(np.array(nmeadatat[:, 0], dtype=float), tt_sp3_new,
+                                                      return_indices=True)
+                tempdata = tempdata[ind_nmea]
+                tempdata[:, 2] = elvt[ind_sp3]
+                tempdata[:, 3] = azit[ind_sp3]
+            elif sp3dir:
+                print('missing orbit data for ' + satidt)
+                tempdata = []
+            # then collect all the data
+            if len(tempdata) > 0:
                 snrdata = np.vstack((snrdata, tempdata))
-            else:
-                print('missing orbit data for '+satidt)
-        snr_df = pd.DataFrame({'datenum': snrdata[:, 0], 'sat_id': snrdata[:, 1], 'elevation': snrdata[:, 2],
+        tfilter = np.logical_and(snrdata[:, 2] >= elvlims[0], snrdata[:, 2] <= elvlims[1])
+        snrdata = snrdata[tfilter]
+        tfilter = np.logical_and(snrdata[:, 3] >= azilims[0], snrdata[:, 3] <= azilims[1])
+        snrdata = snrdata[tfilter]
+        snr_df = pd.DataFrame({'datenum': snrdata[:, 0], 'sat_prn': snrdata[:, 1], 'elevation': snrdata[:, 2],
                                'azimuth': snrdata[:, 3], 'snr': snrdata[:, 4], 'seconds': snrdata[:, 5]})
         nanfilter = np.isnan(fixdata[:, 0]) == 0
         fixdata = fixdata[nanfilter, :]
@@ -380,7 +405,7 @@ def nmea2snr(nmeastr, sp3dir, snrdir, **kwargs):
             snr_df_old = pickle.load(f)
             frames = [snr_df_old, snr_df]
             snr_df = pd.concat(frames, ignore_index=True)
-            snr_df = snr_df.drop_duplicates(subset=['seconds', 'sat_id'])
+            snr_df = snr_df.drop_duplicates(subset=['seconds', 'sat_prn'])
             snr_df = snr_df.sort_values(by=['datenum'], ignore_index=True)
             fix_df_old = pickle.load(f)
             frames = [fix_df_old, fix_df]
@@ -437,11 +462,11 @@ def snr2arcs(snr_df, rhlims, signal='L1', arctlim=False, pktnlim=0, normalize=Fa
 
     if 'satconsts' in kwargs:
         satconsts = kwargs.get('satconsts')
-        # snr_df['sat_id'].astype(str).str[0]
+        # snr_df['sat_prn'].astype(str).str[0]
         allsats = ['G', 'R', 'E']
         for satc in allsats:
             if satc not in satconsts:
-                tfilter = snr_df['sat_id'].astype(str).str[0] != satc
+                tfilter = snr_df['sat_prn'].astype(str).str[0] != satc
                 snr_df = snr_df[tfilter]
 
     # elvlims and azilims
@@ -456,8 +481,8 @@ def snr2arcs(snr_df, rhlims, signal='L1', arctlim=False, pktnlim=0, normalize=Fa
 
     rh_arr = np.empty((0, 14))
     snr_dt = np.empty((0, 4), dtype=object)
-    for sat in np.unique(snr_df['sat_id']):
-        tfilter = snr_df['sat_id'] == sat
+    for sat in np.unique(snr_df['sat_prn']):
+        tfilter = snr_df['sat_prn'] == sat
         temp_df = snr_df[tfilter]
         if sat[0] == 'G' or sat[0] == 'E':
             if signal == 'L1':
@@ -659,7 +684,7 @@ def invsnr(sdatetime, edatetime, snrdir, invdir, kspac, tlen, rhlims, snrfit=Tru
     :param arctlim: split satellite arcs into sub arcs of length arctlim (in seconds)
     :param pktnlim: QC condition, ratio of periodogram peak to noise must be greater than this value
     :param normalize: normalize the snr prior to inversion
-    :param smoothqc: qc to filter out refl_hgt values > 3 std away from smoothed signal using savgol_filter
+    :param smoothqc: qc to filter out refl_hgt values > 3 std away from smoothed signal using mov_avg
     :param bspline_order: default = 2, not worth going higher and definitely don't want 1 (linear)
     :param kwargs:
     elvlims: elevation angle limits (e.g., [5, 30])
@@ -714,6 +739,7 @@ def invsnr(sdatetime, edatetime, snrdir, invdir, kspac, tlen, rhlims, snrfit=Tru
             continue
         rh_df, snrdt_df = snr2arcs(snr_df, rhlims, signal=signal, arctlim=arctlim, pktnlim=pktnlim, normalize=normalize,
                                    **kwargs)
+
         if 'satconsts' in kwargs:
             satconsts = kwargs.get('satconsts')
         else:
@@ -746,32 +772,32 @@ def invsnr(sdatetime, edatetime, snrdir, invdir, kspac, tlen, rhlims, snrfit=Tru
             #print('got rid of ' + str(presm - len(rh_df.index)) + ' points')
 
         if largetides:
-            tfilter = np.logical_and(rh_df['datenum'].values > date2num(tdatetime + tlen_td/3),
-                                     rh_df['datenum'].values < date2num(tdatetime + 2*tlen_td/3))
-            tfilter = np.where(tfilter)[0]
-            if tfilter[0] != 0:
-                tfilter = np.append(tfilter[0]-1, tfilter)
-            if tfilter[-1] != len(rh_df.index)-1:
-                tfilter = np.append(tfilter, tfilter[-1]+1)
-            temp_df = rh_df.iloc[tfilter]
+            temp_dn = np.sort(rh_df['datenum'].values)
         else:
-            tfilter = np.logical_and(snrdt_df['datenum'].values > date2num(tdatetime + tlen_td / 3),
-                                     snrdt_df['datenum'].values < date2num(tdatetime + 2 * tlen_td / 3))
-            tfilter = np.where(tfilter)[0]
+            temp_dn = np.sort(snrdt_df['datenum'].values)
+        tfilter = np.logical_and(temp_dn > date2num(tdatetime + tlen_td / 3),
+                                 temp_dn < date2num(tdatetime + 2 * tlen_td / 3))
+        tfilter = np.where(tfilter)[0]
+        try:
             if tfilter[0] != 0:
                 tfilter = np.append(tfilter[0] - 1, tfilter)
-            if tfilter[-1] != len(snrdt_df.index) - 1:
+            if tfilter[-1] != len(temp_dn) - 1:
                 tfilter = np.append(tfilter, tfilter[-1] + 1)
-            temp_df = snrdt_df.iloc[tfilter]
-
-        temp_df = temp_df.sort_values(by=['datenum'], ignore_index=True)
-        maxtgap = np.max(np.ediff1d(temp_df['datenum'].values))
+            temp_dn = temp_dn[tfilter]
+        except IndexError:
+            print('not enough data - continue')
+            continue
+        maxtgap = np.max(np.ediff1d(temp_dn))
+        mintgap = np.min(np.ediff1d(temp_dn))
+        if mintgap < 0:
+            print('issue - values not in order')
+            continue
         print('max gap is ' + str(int(maxtgap * 24 * 60)) + ' minutes')
 
         if maxtgap > kspac:
             print('gap in data bigger than node spacing')
-            print('continue with risk of instabilities')
-            # continue
+            # print('continue with risk of instabilities')
+            continue
 
         knots = np.hstack((tdatenum * np.ones(bspline_order),
                           np.linspace(tdatenum, tdatenum_end, int(tlen / kspac + 1)),
@@ -826,7 +852,7 @@ def invsnr(sdatetime, edatetime, snrdir, invdir, kspac, tlen, rhlims, snrfit=Tru
     return
 
 
-def invsnr_plot(sdatetime, edatetime, invdir, plotl=1/(24*10), **kwargs):
+def invsnr_plot(sdatetime, edatetime, invdir, plotl=1/(24*10), cubspl=False, **kwargs):
     """
     plot output from the 'invsnr' function above and compare with tide gauge, if given as input
     the figure is saved to a file, 'reflh_test.png'
@@ -873,6 +899,13 @@ def invsnr_plot(sdatetime, edatetime, invdir, plotl=1/(24*10), **kwargs):
                 inds = 0
             elif tdatetime == edatetime - tlen_td/3:
                 inde = int(tlen/kspac + bspline_order)
+            if cubspl:
+                inds = int(tlen / (3 * kspac))
+                inde = int((2 * tlen) / (3 * kspac))
+                if tdatetime == edatetime - tlen_td / 3:
+                    inde = int((2 * tlen) / (3 * kspac)) + 1
+                if tdatetime == sdatetime:
+                    inds = int(tlen / (3 * kspac)) - 1
             try:
                 f = open(tfilestr, 'rb')
                 invout = pickle.load(f)
@@ -884,21 +917,21 @@ def invsnr_plot(sdatetime, edatetime, invdir, plotl=1/(24*10), **kwargs):
                 frames = [rh_df, rh_dft]
                 rh_df = pd.concat(frames, ignore_index=True)
                 # now get the scaling factors if they exist
-                sfacs_spectralt = invout['sfacs_spectral']
+                sfacs_spectralt = invout['sfacs_spectral'][inds:inde]
                 if 'sfacs_js' in invout:
-                    sfacs_jst = invout['sfacs_js']
+                    sfacs_jst = invout['sfacs_js'][inds:inde]
             except IOError:
                 if dispmissedmsg:
                     print('missing data on ' + str(tdatetime.date()) + ' ' + str(tdatetime.time()) + ' putting nans')
                     dispmissedmsg = False
-                sfacs_spectralt = np.empty(inde-inds+1)
+                sfacs_spectralt = np.empty(inde-inds)
                 sfacs_spectralt[:] = np.nan
                 if 'sfacs_js' in invout:
-                    sfacs_jst = np.empty(inde-inds+1)
+                    sfacs_jst = np.empty(inde-inds)
                     sfacs_jst[:] = np.nan
-            sfacs_spectral = np.append(sfacs_spectral, sfacs_spectralt[inds:inde])
+            sfacs_spectral = np.append(sfacs_spectral, sfacs_spectralt)
             if 'sfacs_js' in invout:
-                sfacs_js = np.append(sfacs_js, sfacs_jst[inds:inde])
+                sfacs_js = np.append(sfacs_js, sfacs_jst)
         if len(invdir) > 1:
             cntdir = cntdir + 1
             if cntdir == 0:
@@ -938,12 +971,23 @@ def invsnr_plot(sdatetime, edatetime, invdir, plotl=1/(24*10), **kwargs):
             sfacs_js = np.nanmedian(sfacs_js_toavg, axis=0)
     sdatenum = date2num(sdatetime)
     edatenum = date2num(edatetime)
-    knots = np.hstack((sdatenum - tlen/3 * np.ones(bspline_order),
-                       np.linspace(sdatenum - tlen/3, edatenum + tlen/3,
-                                   int((edatenum - sdatenum + 2*tlen/3) / kspac + 1)),
-                       edatenum + tlen/3 * np.ones(bspline_order)))
     tplot = np.linspace(sdatenum, edatenum, int((edatenum - sdatenum) / plotl + 1))
-    rh_spectral = interpolate.splev(tplot, (knots, sfacs_spectral, bspline_order))
+    if not cubspl:
+        knots = np.hstack((sdatenum - tlen / 3 * np.ones(bspline_order),
+                           np.linspace(sdatenum - tlen / 3, edatenum + tlen / 3,
+                                       int((edatenum - sdatenum + 2 * tlen / 3) / kspac + 1)),
+                           edatenum + tlen / 3 * np.ones(bspline_order)))
+        rh_spectral = interpolate.splev(tplot, (knots, sfacs_spectral, bspline_order))
+    else:
+        knots = np.linspace(sdatenum - kspac/2, edatenum + kspac/2, int((edatenum - sdatenum) / kspac + 2))
+        tfilter = np.isnan(sfacs_spectral) == 0
+        sfacs_spectral = sfacs_spectral[tfilter]
+        knots = knots[tfilter]
+        tfilter = np.logical_and(tplot[:] >= np.min(knots), tplot[:] <= np.max(knots))
+        tplot = tplot[tfilter]
+        cubspl_f = interpolate.interp1d(knots, sfacs_spectral, kind='cubic')
+        rh_spectral = cubspl_f(tplot)
+
     fig, ax = plt.subplots(figsize=(8, 4))
     if 'tgstr' in kwargs:
         rh_df['refl_hgt'] = np.mean(rh_df['refl_hgt'].values) - rh_df['refl_hgt'].values
@@ -957,12 +1001,18 @@ def invsnr_plot(sdatetime, edatetime, invdir, plotl=1/(24*10), **kwargs):
         ptg.set_label('tide gauge')
         # now calculate rms
         rh_spectral_rms = interpolate.splev(tgdata[:, 0], (knots, sfacs_spectral, bspline_order))
+        if cubspl:
+            tfilter = np.logical_and(tgdata[:, 0] >= np.min(knots), tgdata[:, 0] <= np.max(knots))
+            rh_spectral_rms = cubspl_f(tgdata[tfilter, 0])
         tf = ~np.isnan(rh_spectral_rms)
         rh_spectral_rms = np.nanmean(rh_spectral_rms) - rh_spectral_rms
         rh_spectral = np.nanmean(rh_spectral) - rh_spectral
-        rms_spectral = np.sqrt(np.mean((rh_spectral_rms[tf] - tgdata[tf, 1]) ** 2))*100
+        if not cubspl:
+            rms_spectral = np.sqrt(np.mean((rh_spectral_rms[tf] - tgdata[tf, 1]) ** 2))*100
+        else:
+            rms_spectral = np.sqrt(np.mean((rh_spectral_rms[tf] - tgdata[tfilter, 1]) ** 2)) * 100
         print('rms_spectral is %.3f cm' % rms_spectral)
-        corr_spectral = pearsonr(rh_spectral_rms[tf], tgdata[tf, 1])
+        # corr_spectral = pearsonr(rh_spectral_rms[tf], tgdata[tf, 1])
         # print('corr_spectral is %.3f' % corr_spectral[0])
     parc, = plt.plot_date(rh_df['datenum'], rh_df['refl_hgt'], '.')
     parc.set_label('arcs')
